@@ -23,6 +23,6 @@
 | `SUPABASE_URL` | Supabase 프로젝트 주소 |
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase 서비스 키 |
 | `DATA_GO_KR_KEY` | 공공데이터포털 인증키 |
-| `REVALIDATE_SECRET` | 사이트 화면 갱신 요청 키 (Vercel 환경변수와 같은 값) |
+| `REVALIDATE_SECRET` | (선택) 사이트 화면 갱신 요청 키. 없으면 서비스 키로 만든 확인값을 보낸다 |
 
 출처: 건강보험심사평가원, 국립중앙의료원, 국민건강보험공단, 보험개발원, 한국천문연구원 공공데이터.
