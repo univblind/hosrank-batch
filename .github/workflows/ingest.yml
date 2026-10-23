@@ -26,6 +26,10 @@ on:
         description: "의원 많이 진료한 질병·평가 우수기관 수집 (1 = 실행, force = 우수기관도 날짜 무시하고 다시 받기). 정기 실행은 매일 자동"
         required: false
         default: ""
+      npay_boost:
+        description: "병원별 비급여를 몰아서 받기 (예: 3 = 동시 3곳, 남은 병원 전부, 최대 280분). 첫 바퀴용 — 정기 실행은 늘 한 번에 한 곳"
+        required: false
+        default: ""
 
 concurrency:
   group: ingest
@@ -239,7 +243,13 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          NPAY_BOOST: ${{ github.event.inputs.npay_boost }}
         run: |
+          # 몰아서 받기(수동 실행 npay_boost=N): 남은 병원 전부를 동시 N곳으로 최대 280분. 첫 바퀴를 하루에 끝낼 때만 쓴다
+          if [ -n "$NPAY_BOOST" ]; then
+            npx tsx scripts/ingest-npay-web.ts --concurrency "$NPAY_BOOST" --limit 90000 --minutes 280
+            exit 0
+          fi
           # 병원 하나에 한 번씩, 한 번에 하나씩 천천히 받는다(심평원 서버 부담 최소화, 초당 1~2건). 처음 한 바퀴(약 8만 곳)는 하루 1만 2천 곳씩 약 1주,
           # 그 뒤로는 받은 지 30일 지난 병원만 하루 약 2,900곳(전체 ÷ 28). 150분이 지나면 받은 곳까지만 저장하고 다음 날 이어서 받는다
           npx tsx scripts/ingest-npay-web.ts --minutes 150
