@@ -275,9 +275,15 @@ jobs:
         if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && github.ref == 'refs/heads/main' }}
         env:
           REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
+          # REVALIDATE_SECRET 이 없으면 서비스 키로 만든 확인값을 보낸다(사이트가 같은 방법으로 확인, 키 자체는 보내지 않음)
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SITE_URL: ${{ vars.SITE_URL || 'https://hoscheck.com' }}
         run: |
-          if [ -z "$REVALIDATE_SECRET" ]; then echo "REVALIDATE_SECRET 미설정 — 건너뜀"; exit 0; fi
+          if [ -z "$REVALIDATE_SECRET" ] && [ -n "$SUPABASE_SERVICE_ROLE_KEY" ]; then
+            REVALIDATE_SECRET=$(node -e 'process.stdout.write(require("crypto").createHmac("sha256",process.env.SUPABASE_SERVICE_ROLE_KEY).update("hoscheck:revalidate:v1").digest("hex"))')
+            echo "::add-mask::$REVALIDATE_SECRET"
+          fi
+          if [ -z "$REVALIDATE_SECRET" ]; then echo "화면 갱신 확인값 없음 — 건너뜀"; exit 0; fi
           for i in 1 2 3; do
             if curl -fsS -X POST -H "Authorization: Bearer $REVALIDATE_SECRET" "$SITE_URL/api/revalidate"; then
               echo
