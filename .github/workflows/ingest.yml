@@ -1,0 +1,392 @@
+name: 공공데이터 수집
+run-name: ${{ (github.event.inputs.retry_attempt != '' && github.event.inputs.retry_attempt != '1') && format('공공데이터 수집 (새 서버로 다시 실행 {0}번째)', github.event.inputs.retry_attempt) || '공공데이터 수집' }}
+
+on:
+  schedule:
+    # 매일 03:17 KST (전날 18:17 UTC). 정각은 GitHub 정기 실행이 몰려 몇 시간씩 늦게 시작되므로 비켜 둔다. 상세(detail) 단계는 서비스별 일일 한도(10,000) 때문에 매일 조금씩 이어서 수집한다.
+    - cron: "17 18 * * *"
+    # 보조 실행 05:47 KST: 그날 수집이 이미 끝났으면 바로 끝낸다(아래 '오늘 수집 여부 확인'). GitHub 가 정기 실행을 건너뛰거나
+    # 첫 실행이 일시 오류로 실패한 날에만 실제로 수집한다
+    - cron: "47 20 * * *"
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: "실행 단계 (쉼표 구분: basis,depts,eval,nonpay,detail,scores,pharmacy,nmchours,checkup,silson24,holidays,beds,npayweb). 비우면 기본 조합"
+        required: false
+        default: ""
+      retry_attempt:
+        description: "정기 실행처럼 돌리기 (1 = 지금 정기 실행 한 번, 2~6 = 자동 재시도 번호). 비우면 일반 수동 실행"
+        required: false
+        default: ""
+      sido:
+        description: "시도 코드만 수집 (예: 110000 서울). 비우면 전국"
+        required: false
+        default: ""
+      hira_extra:
+        description: "의원 많이 진료한 질병·평가 우수기관 수집 (1 = 실행, force = 우수기관도 날짜 무시하고 다시 받기). 정기 실행은 매일 자동"
+        required: false
+        default: ""
+
+concurrency:
+  group: ingest
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    # data/meta.json(데이터 기준 월)이 바뀐 날 커밋·푸시해야 해서 저장소 쓰기 권한이 필요하다
+    permissions:
+      contents: write
+      # 공공데이터포털에 연결되지 않는 서버에 배정되면 이 워크플로를 새 서버로 다시 실행한다
+      actions: write
+    env:
+      # 각 수집 스크립트가 한국어 결과를 여기에 모으고, 마지막 '결과 요약' 단계가 실행 화면 맨 위에 보여 준다
+      INGEST_SUMMARY_FILE: /tmp/ingest-summary.md
+      # 정기 실행이거나, 정기 실행의 자동 재시도·정기 실행 대신 돌린 수동 실행
+      IS_SCHEDULED: ${{ github.event_name == 'schedule' || github.event.inputs.retry_attempt != '' }}
+      ATTEMPT: ${{ github.event.inputs.retry_attempt || '1' }}
+    steps:
+      - name: 오늘 수집 여부 확인 (보조 실행만)
+        id: fresh
+        if: github.event_name == 'schedule' && github.event.schedule == '47 20 * * *'
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          # 병원 기본목록 수집이 전국 병원의 updated_at 을 고친다. 최근 8시간 안이면 오늘 수집은 이미 끝난 것
+          last=$(curl -s -m 20 "$SUPABASE_URL/rest/v1/hospitals?select=updated_at&order=updated_at.desc&limit=1" \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" | jq -r '.[0].updated_at // empty')
+          echo "마지막 수집: ${last:-알 수 없음}"
+          if [ -n "$last" ] && [ $(( $(date -u +%s) - $(date -u -d "$last" +%s) )) -lt 28800 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "오늘 수집이 이미 끝나 보조 실행을 건너뜁니다."
+          fi
+      - uses: actions/checkout@v5
+        if: steps.fresh.outputs.skip != 'true'
+        # 코드는 비공개 저장소 univblind/hosrank 에 있다. 배치용 열쇠(쓰기 가능: data/meta.json 기준 월 커밋)로 받아 온다
+        with:
+          repository: univblind/hosrank
+          ref: main
+          ssh-key: ${{ secrets.HOSRANK_DEPLOY_KEY }}
+      - uses: actions/setup-node@v5
+        if: steps.fresh.outputs.skip != 'true'
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+        if: steps.fresh.outputs.skip != 'true'
+      - name: 도메인 만료 확인 (hoscheck.com, 30일 전부터 경고)
+        id: domain
+        if: github.event_name == 'schedule' && steps.fresh.outputs.skip != 'true'
+        continue-on-error: true
+        run: |
+          # 가비아에서 산 도메인이라 자동 연장은 가비아 설정을 따른다. 만료가 다가오면 실패로 표시해 메일이 가게 한다
+          exp=$(curl -s -m 20 https://rdap.verisign.com/com/v1/domain/hoscheck.com | jq -r '.events[] | select(.eventAction=="expiration") | .eventDate' || true)
+          if [ -z "$exp" ]; then echo "만료일을 읽지 못함 — 건너뜀"; exit 0; fi
+          days=$(( ( $(date -u -d "$exp" +%s) - $(date -u +%s) ) / 86400 ))
+          echo "hoscheck.com 만료 $exp (${days}일 남음)"
+          if [ "$days" -lt 30 ]; then
+            echo "- ⚠ hoscheck.com 도메인이 ${days}일 뒤(${exp%%T*}) 만료됩니다. 가비아에서 연장하세요." >> "$INGEST_SUMMARY_FILE"
+            exit 1
+          fi
+      - name: 연결 확인 (공공데이터포털·Supabase)
+        id: connect
+        if: steps.fresh.outputs.skip != 'true'
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          INPUT_PHASE: ${{ github.event.inputs.phase }}
+        run: |
+          # 점수 다시 계산(scores)만 하는 수동 실행은 공공데이터포털이 필요 없다
+          if [ -n "$INPUT_PHASE" ] && [ -z "$(echo ",$INPUT_PHASE," | sed -e "s/,scores,/,/g" -e "s/^,*//" -e "s/,*$//")" ]; then
+            echo "점수 계산만 실행 — 공공데이터포털 연결 확인 생략"; echo "ok=1" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # GitHub 실행 서버(해외 IP) 중 일부는 공공데이터포털 접속이 막혀 있다(연결 시간 초과).
+          # 인증키 없이 접속만 확인한다 (401/403 이면 서버까지는 닿은 것, 000 이면 연결 자체 실패)
+          ip=$(curl -s -m 10 https://api.ipify.org || echo 확인불가)
+          echo "러너 공인 IP: $ip"
+          ok=0
+          for i in 1 2 3 4 5 6; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" -m 15 https://apis.data.go.kr/B551182/hospAsmInfoService1/getHospAsmInfo1 || true)
+            echo "apis.data.go.kr → HTTP $code ($i/6)"
+            if [ "$code" != "000" ]; then ok=1; break; fi
+            sleep 15
+          done
+          code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 "$SUPABASE_URL/rest/v1/" || true)
+          echo "Supabase → HTTP $code"
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+          echo "ip=$ip" >> "$GITHUB_OUTPUT"
+          if [ "$ok" != "1" ]; then echo "::warning::이 실행 서버(IP $ip)에서는 공공데이터포털에 연결되지 않습니다. 수집을 건너뛰고 새 서버로 다시 실행합니다."; fi
+      - name: 수집 실행
+        id: main
+        if: steps.connect.outputs.ok == '1'
+        env:
+          DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          INPUT_PHASE: ${{ github.event.inputs.phase }}
+          INPUT_SIDO: ${{ github.event.inputs.sido }}
+        run: |
+          # pharmacy·nmchours·checkup·silson24 는 별도 스크립트(다음 단계들)라 여기서는 뺀다. 그것만 고르면 이 단계는 건너뛴다
+          PHASE=$(echo ",$INPUT_PHASE," | sed -e 's/,pharmacy,/,/g' -e 's/,nmchours,/,/g' -e 's/,checkup,/,/g' -e 's/,silson24,/,/g' -e 's/,holidays,/,/g' -e 's/,beds,/,/g' -e 's/,npayweb,/,/g' -e 's/^,*//' -e 's/,*$//')
+          if [ -n "$INPUT_PHASE" ] && [ -z "$PHASE" ]; then echo "pharmacy·nmchours·checkup·silson24 만 실행"; exit 0; fi
+          if [ -z "$PHASE" ]; then
+            # 기본: 기본목록·진료과목·평가등급·상세·점수.
+            # 진료과목별 소속(depts, 약 16분)은 거의 바뀌지 않아 월요일에만. 새 병원·바뀐 병원의 진료과목은 매일 상세(detail) 단계가 받는다
+            # 비급여는 API(병원급만) 대신 아래 '병원별 비급여' 단계가 심평원 누리집에서 병원·의원 모두 받는다(2026-10-23부터)
+            PHASE="basis,eval,detail,scores"
+            if [ "$(TZ=Asia/Seoul date +%u)" = "1" ]; then PHASE="basis,depts,eval,detail,scores"; fi
+          fi
+          ARGS="--phase $PHASE --budget 9000"
+          if [ -n "$INPUT_SIDO" ]; then ARGS="$ARGS --sido $INPUT_SIDO"; fi
+          echo "npx tsx scripts/ingest.ts $ARGS"
+          npx tsx scripts/ingest.ts $ARGS
+      - name: 응급실 (국립중앙의료원 응급의료기관 목록, 매일)
+        id: er
+        if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && (env.IS_SCHEDULED == 'true' || contains(github.event.inputs.phase, 'er')) }}
+        env:
+          DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          # 목록 약 530곳을 1번 호출로 받아 hospitals.er_night·er_class 를 맞춘다. 매칭이 400곳 미만이면 갱신하지 않고 실패한다
+          npx tsx scripts/ingest-er.ts
+      - name: 병상 수 (심평원 시설정보, 30일마다 돌아가며)
+        id: beds
+        if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && (env.IS_SCHEDULED == 'true' || contains(github.event.inputs.phase, 'beds')) }}
+        env:
+          DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          # 병원급 이상 약 4,200곳을 확인한 지 30일 지난 곳만 다시 받는다(평소 하루 100~200번 호출). 실패해도 화면에는 지난 값이 남는다
+          npx tsx scripts/ingest-beds.ts || echo "::warning::병상 수 수집 실패"
+      - name: 공휴일 (한국천문연구원 특일 정보, 매일)
+        id: holidays
+        if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && (env.IS_SCHEDULED == 'true' || contains(github.event.inputs.phase, 'holidays')) }}
+        env:
+          DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          # 올해·내년 공휴일(대체·임시공휴일 포함)을 2번 호출로 받는다. 실패해도 화면은 코드 안 목록으로 동작하므로 경고만 남긴다
+          npx tsx scripts/ingest-holidays.ts
+      - name: 약국 수집 (국립중앙의료원, 매주 월요일)
+        id: pharmacy
+        if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && (env.IS_SCHEDULED == 'true' || contains(github.event.inputs.phase, 'pharmacy')) }}
+        env:
+          DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          # 전국 약 2만 5천 곳을 6번 호출로 받는다(일 한도 1,000). 정기 실행은 월요일 03:00 KST(일요일 UTC)에만
+          if [ "$IS_SCHEDULED" = "true" ] && [ "$(TZ=Asia/Seoul date +%u)" != "1" ]; then echo "월요일이 아니라 건너뜀"; exit 0; fi
+          npx tsx scripts/ingest-pharmacy.ts
+      - name: 진료시간 보완 (국립중앙의료원 병·의원 찾기, 매주 월요일)
+        id: nmchours
+        if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && (env.IS_SCHEDULED == 'true' || contains(github.event.inputs.phase, 'nmchours')) }}
+        env:
+          DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          # 전국 약 7만 9천 곳을 16번 호출로 받아(일 한도 1,000), 심평원 진료시간이 없는 병원만 hospital_hours_extra 를 통째로 갱신한다.
+          # 심평원 상세(매일 일부씩)가 진료시간을 새로 받은 병원은 다음 주 이 단계에서 빠진다. 정기 실행은 월요일 03:00 KST 에만
+          if [ "$IS_SCHEDULED" = "true" ] && [ "$(TZ=Asia/Seoul date +%u)" != "1" ]; then echo "월요일이 아니라 건너뜀"; exit 0; fi
+          npx tsx scripts/ingest-nmc-hours.ts
+      - name: 국가건강검진기관 (국민건강보험공단, 매주 월요일)
+        id: checkup
+        if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && (env.IS_SCHEDULED == 'true' || contains(github.event.inputs.phase, 'checkup')) }}
+        env:
+          DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          # 전국 목록 4번 호출 + 검진유형내역 파일 1개 + 기관별 상세(접수·점심·예약) 최대 9,000곳(일 한도 10,000).
+          # 상세는 안 받은 곳 → 오래된 곳 순이라 전국 약 1만 8천 곳이 2주에 한 바퀴 돈다. 정기 실행은 월요일 03:00 KST 에만
+          if [ "$IS_SCHEDULED" = "true" ] && [ "$(TZ=Asia/Seoul date +%u)" != "1" ]; then echo "월요일이 아니라 건너뜀"; exit 0; fi
+          npx tsx scripts/ingest-checkup.ts --detail-limit 9000
+      - name: 실손24 참여 기관 (보험개발원, 매주 월요일 변경분)
+        id: silson24
+        if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && (env.IS_SCHEDULED == 'true' || contains(github.event.inputs.phase, 'silson24')) }}
+        env:
+          DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          # 지난번에 받은 변경일시 이후 바뀐 기관만 받는다(보통 1~2회 호출, 전체도 53회). 표가 비어 있으면 전체.
+          # 정기 실행은 월요일 03:00 KST(일요일 UTC)에만. 수동 실행에서 phase 에 silson24 를 넣으면 바로 돈다
+          if [ "$IS_SCHEDULED" = "true" ] && [ "$(TZ=Asia/Seoul date +%u)" != "1" ]; then echo "월요일이 아니라 건너뜀"; exit 0; fi
+          npx tsx scripts/ingest-silson24.ts
+      - name: 의원 많이 진료한 질병·평가 우수기관 (심평원, 매일 한도만큼 · 우수기관 매월)
+        id: hiraextra
+        if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && (env.IS_SCHEDULED == 'true' || github.event.inputs.hira_extra != '') }}
+        env:
+          DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          HIRA_EXTRA: ${{ github.event.inputs.hira_extra }}
+        run: |
+          # 질병: 의원(약 3만 8천 곳)마다 1회 호출이라 하루 9,000곳씩 이어 받고(약 5일에 한 바퀴), 그 뒤로는 90일 지난 의원만 다시 받는다.
+          # 우수기관: 전국 목록 7회 호출. 지난 수집이 25일 안이면 스크립트가 알아서 건너뛴다(매월 갱신). 두 서비스는 각자 일 10,000건 한도
+          # 동시 8개: 상세 단계도 병원 하나에 4개씩 동시에 받아 문제없었다(GitHub 실행 시간을 아끼려고 3 → 8)
+          ARGS="--budget 9000 --concurrency 8"
+          if [ "$HIRA_EXTRA" = "force" ]; then ARGS="$ARGS --force"; fi
+          npx tsx scripts/ingest-hira-extra.ts $ARGS
+      - name: 병원별 비급여 (심평원 누리집, 매일 조금씩 · 한 달에 한 바퀴)
+        id: npayweb
+        if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && (env.IS_SCHEDULED == 'true' || contains(github.event.inputs.phase, 'npayweb')) }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          # 병원 하나에 한 번씩, 한 번에 하나씩 천천히 받는다(심평원 서버 부담 최소화, 초당 1~2건). 처음 한 바퀴(약 8만 곳)는 하루 1만 2천 곳씩 약 1주,
+          # 그 뒤로는 받은 지 30일 지난 병원만 하루 약 2,900곳(전체 ÷ 28). 150분이 지나면 받은 곳까지만 저장하고 다음 날 이어서 받는다
+          npx tsx scripts/ingest-npay-web.ts --minutes 150
+      - name: 바뀐 병원 검색엔진 알림 (IndexNow, 매일)
+        id: indexnow_changes
+        # 병원을 바꾸는 모든 수집 단계가 끝난 뒤. 화면 정보 지문이 달라진 병원과 새 병원만 content_changed_at 을 올리고(사이트맵 lastmod),
+        # 그 병원 상세 주소만 Bing·네이버에 알린다. 일부 수집이 실패해도 성공한 만큼의 변경은 알린다
+        if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && (env.IS_SCHEDULED == 'true' || contains(github.event.inputs.phase, 'indexnow')) }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SITE_URL: ${{ vars.SITE_URL || 'https://hoscheck.com' }}
+        run: npx tsx scripts/indexnow-changes.ts
+      - name: 이용 팁 보관 기간 지난 기록 파기 (매일)
+        id: purge_tips
+        # 개인정보처리방침: 삭제한 글과 처리된 신고는 6개월 뒤 지운다(IP 포함). 실패해도 수집에는 영향 없음
+        if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && env.IS_SCHEDULED == 'true' }}
+        continue-on-error: true
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: npx tsx scripts/purge-tips.ts
+      - name: IndexNow 제출 (Bing·네이버, 매주 월요일)
+        id: indexnow
+        if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && (env.IS_SCHEDULED == 'true' || contains(github.event.inputs.phase, 'indexnow')) }}
+        run: |
+          # 수집이 끝난 뒤 사이트맵의 허브·순위·가격·약국 URL 을 검색엔진에 알린다(병원 상세는 위 '바뀐 병원' 단계가 매일 따로 보낸다)
+          if [ "$IS_SCHEDULED" = "true" ] && [ "$(TZ=Asia/Seoul date +%u)" != "1" ]; then echo "월요일이 아니라 건너뜀"; exit 0; fi
+          npx tsx scripts/indexnow.ts
+      - name: 화면 캐시 갱신 (수집한 데이터를 순위·상세 페이지에 바로 반영)
+        id: revalidate
+        # 페이지는 최대 7일 캐시(ISR)라, 수집이 끝나면 사이트에 다시 그리라고 알린다. 일부 단계가 실패해도 성공한 수집분은 반영한다
+        if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && github.ref == 'refs/heads/main' }}
+        env:
+          REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
+          SITE_URL: ${{ vars.SITE_URL || 'https://hoscheck.com' }}
+        run: |
+          if [ -z "$REVALIDATE_SECRET" ]; then echo "REVALIDATE_SECRET 미설정 — 건너뜀"; exit 0; fi
+          for i in 1 2 3; do
+            if curl -fsS -X POST -H "Authorization: Bearer $REVALIDATE_SECRET" "$SITE_URL/api/revalidate"; then
+              echo
+              printf '### ✅ 사이트 반영\n\n- 순위·상세 페이지를 새 데이터로 다시 그리도록 요청했습니다.\n' >> "$INGEST_SUMMARY_FILE"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "캐시 갱신 요청 실패"; exit 1
+      - name: 데이터 기준 월 반영 (data/meta.json 이 바뀐 날만 커밋 → Vercel 재배포)
+        id: meta
+        # 앞 단계 일부가 실패해도, 성공한 수집이 올린 기준 월은 반영한다(실패한 수집은 기준 월을 올리지 않는다)
+        # main 에서 돌 때만 (다른 브랜치에서 수동 실행하면 그 브랜치 커밋이 main 으로 올라가지 않게)
+        if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && github.ref == 'refs/heads/main' }}
+        run: |
+          if git diff --quiet -- data/meta.json; then echo "기준 월 변화 없음 — 커밋하지 않음"; echo "- 데이터 기준 월: 그대로" >> "$INGEST_SUMMARY_FILE"; exit 0; fi
+          git diff -- data/meta.json
+          SUMMARY=$(node -e 'const m=require("./data/meta.json");console.log(Object.entries(m).map(([k,v])=>k+" "+v.month).join(", "))')
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/meta.json
+          git commit -m "데이터 기준 월 갱신: $SUMMARY"
+          # 그사이 다른 커밋이 올라왔을 수 있어 최신 main 위로 올린 뒤 푸시한다
+          for i in 1 2 3; do
+            if git pull --rebase origin main && git push origin HEAD:main; then echo "- 데이터 기준 월 갱신: $SUMMARY (사이트 재배포)" >> "$INGEST_SUMMARY_FILE"; exit 0; fi
+            sleep 10
+          done
+          echo "기준 월 커밋 푸시 실패"; exit 1
+      - name: 새 서버로 다시 실행 (공공데이터포털 연결 안 됨)
+        id: retry
+        if: ${{ !cancelled() && steps.fresh.outputs.skip != 'true' && steps.connect.outputs.ok != '1' && env.IS_SCHEDULED == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 새 실행은 새 서버(다른 IP)에 배정된다. 같은 날 최대 6번까지
+          next=$((ATTEMPT + 1))
+          if [ "$next" -gt 6 ]; then
+            echo "- ❌ 6번 연속 공공데이터포털에 연결되지 않는 서버에 배정돼 오늘 수집을 하지 못했습니다. 내일 정기 실행에서 다시 시도합니다." >> "$INGEST_SUMMARY_FILE"
+            exit 1
+          fi
+          gh workflow run ingest.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" -f retry_attempt="$next"
+          echo "retried=$next" >> "$GITHUB_OUTPUT"
+          echo "- 공공데이터포털에 연결되지 않는 서버(IP ${{ steps.connect.outputs.ip }})에 배정돼 수집을 건너뛰고, 새 서버로 다시 실행했습니다 ($next번째). 결과는 그 실행에서 확인하세요." >> "$INGEST_SUMMARY_FILE"
+      - name: 결과 요약 (실행 화면 맨 위 한국어 표)
+        if: always()
+        env:
+          EVENT: ${{ github.event_name }}
+          R_CONNECT: ${{ steps.connect.outcome }}
+          R_MAIN: ${{ steps.main.outcome }}
+          R_ER: ${{ steps.er.outcome }}
+          R_PHARMACY: ${{ steps.pharmacy.outcome }}
+          R_NMCHOURS: ${{ steps.nmchours.outcome }}
+          R_CHECKUP: ${{ steps.checkup.outcome }}
+          R_SILSON: ${{ steps.silson24.outcome }}
+          R_HIRAEXTRA: ${{ steps.hiraextra.outcome }}
+          R_NPAYWEB: ${{ steps.npayweb.outcome }}
+          R_INDEXNOW_CHANGES: ${{ steps.indexnow_changes.outcome }}
+          R_INDEXNOW: ${{ steps.indexnow.outcome }}
+          R_REVALIDATE: ${{ steps.revalidate.outcome }}
+          R_META: ${{ steps.meta.outcome }}
+          CONNECT_OK: ${{ steps.connect.outputs.ok }}
+          SKIPPED: ${{ steps.fresh.outputs.skip }}
+          R_DOMAIN: ${{ steps.domain.outcome }}
+          RETRIED: ${{ steps.retry.outputs.retried }}
+          R_RETRY: ${{ steps.retry.outcome }}
+        run: |
+          label() {
+            case "$1" in
+              success) echo "✅ 성공" ;;
+              failure) echo "❌ 실패" ;;
+              cancelled) echo "⏹ 취소됨" ;;
+              *) echo "➖ 실행 안 함" ;;
+            esac
+          }
+          # 월요일 전용 단계는 다른 요일 정기 실행에서 아무 일 없이 '성공'으로 끝난다
+          weekly() {
+            if [ "$IS_SCHEDULED" = "true" ] && [ "$(TZ=Asia/Seoul date +%u)" != "1" ] && [ "$1" = "success" ]; then echo "➖ 월요일에만 실행"; else label "$1"; fi
+          }
+          fails=""
+          for p in "연결 확인=$R_CONNECT" "병원 정보 수집=$R_MAIN" "응급실 목록=$R_ER" "약국=$R_PHARMACY" "진료시간 보완=$R_NMCHOURS" "건강검진기관=$R_CHECKUP" "실손24=$R_SILSON" "바뀐 병원 검색엔진 알림=$R_INDEXNOW_CHANGES" "검색엔진 알림=$R_INDEXNOW" "사이트 화면 갱신=$R_REVALIDATE" "데이터 기준 월 반영=$R_META"; do
+            if [ "${p##*=}" = "failure" ]; then fails="$fails ${p%%=*},"; fi
+          done
+          if [ "$R_HIRAEXTRA" = "failure" ]; then fails="$fails 질병·우수기관,"; fi
+          if [ "$R_NPAYWEB" = "failure" ]; then fails="$fails 병원별 비급여,"; fi
+          {
+            if [ "$SKIPPED" = "true" ]; then echo "## ✅ 오늘 수집은 이미 끝나 보조 실행을 건너뜀"; echo; exit 0
+            elif [ "$CONNECT_OK" != "1" ] && [ -n "$RETRIED" ]; then echo "## 🔁 공공데이터포털 연결이 막힌 서버라 새 서버로 다시 실행 ($RETRIED번째)"
+            elif [ "$CONNECT_OK" != "1" ] && [ "$R_RETRY" = "failure" ]; then echo "## ❌ 6번 모두 공공데이터포털 연결 실패 — 오늘 수집 못 함"
+            elif [ "$CONNECT_OK" != "1" ]; then echo "## ❌ 공공데이터포털 연결 실패"
+            elif [ -z "$fails" ]; then echo "## ✅ 수집 정상 완료"; else echo "## ❌ 일부 실패:${fails%,}"; fi
+            echo
+            echo "$(TZ=Asia/Seoul date '+%Y년 %-m월 %-d일 %H:%M') 한국 시간 · $(if [ "$EVENT" = schedule ]; then echo '매일 새벽 정기 실행'; elif [ "$ATTEMPT" != "1" ]; then echo "정기 실행 다시 시도 ${ATTEMPT}번째"; elif [ "$IS_SCHEDULED" = "true" ]; then echo '정기 실행 대신 수동 실행'; else echo '수동 실행'; fi)"
+            echo
+            echo "| 단계 | 결과 |"
+            echo "|---|---|"
+            echo "| 병원 정보 수집 (심평원) | $(label "$R_MAIN") |"
+            echo "| 응급실 목록 (국립중앙의료원) | $(label "$R_ER") |"
+            echo "| 주말·공휴일 약국 | $(weekly "$R_PHARMACY") |"
+            echo "| 진료시간 보완 (국립중앙의료원) | $(weekly "$R_NMCHOURS") |"
+            echo "| 국가건강검진기관 (건보공단) | $(weekly "$R_CHECKUP") |"
+            echo "| 실손24 참여 기관 | $(weekly "$R_SILSON") |"
+            echo "| 의원 많이 진료한 질병·우수기관 | $(label "$R_HIRAEXTRA") |"
+            echo "| 병원별 비급여 (심평원 누리집) | $(label "$R_NPAYWEB") |"
+            echo "| 바뀐 병원 검색엔진 알림 | $(label "$R_INDEXNOW_CHANGES") |"
+            echo "| 검색엔진 알림 (순위·가격·약국) | $(weekly "$R_INDEXNOW") |"
+            echo "| 사이트 화면 갱신 | $(label "$R_REVALIDATE") |"
+            echo "| 데이터 기준 월 반영 | $(label "$R_META") |"
+            if [ "$R_DOMAIN" = "failure" ]; then echo "| 도메인 만료 확인 | ⚠ 30일 안에 만료 |"; fi
+            echo
+            if [ -n "$fails" ]; then echo "실패한 단계는 왼쪽 목록에서 그 단계를 눌러 자세한 기록을 볼 수 있습니다."; echo; fi
+            if [ -f "$INGEST_SUMMARY_FILE" ]; then echo "---"; echo; cat "$INGEST_SUMMARY_FILE"; fi
+          } >> "$GITHUB_STEP_SUMMARY"

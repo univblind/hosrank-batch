@@ -1,0 +1,88 @@
+name: 명절 비상진료기관 수집
+run-name: 명절 비상진료기관 수집${{ github.event.inputs.force == 'true' && ' (기간 무시)' || '' }}
+
+# 설·추석 연휴에 문 여는 병원·약국(국립중앙의료원 명절 비상진료기관)을 받는다.
+# 보건복지부·지자체 지정 자료는 보통 연휴 1~2주 전에 공개되고 연휴 중에도 바뀌므로, 연휴 시작 21일 전부터 끝난 다음 날까지
+# 하루 두 번 받는다. 그 밖의 날에는 첫 단계에서 바로 끝난다(npm 설치도 하지 않음). 기간은 data/holidays.json 달력으로 정한다.
+on:
+  schedule:
+    # 06:37 KST (전날 21:37 UTC) · 17:37 KST (08:37 UTC). 정각은 GitHub 정기 실행이 몰려 비켜 둔다
+    - cron: "37 21 * * *"
+    - cron: "37 8 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "명절 기간이 아니어도 실행 (true). 지난 명절 자료로 시험할 때"
+        required: false
+        default: "false"
+
+concurrency:
+  group: holiday
+  cancel-in-progress: false
+
+jobs:
+  holiday:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        # 코드는 비공개 저장소 univblind/hosrank 에 있다. 배치용 열쇠(쓰기 가능: data/meta.json 기준 월 커밋)로 받아 온다
+        with:
+          repository: univblind/hosrank
+          ref: main
+          ssh-key: ${{ secrets.HOSRANK_DEPLOY_KEY }}
+      - name: 명절 수집 기간인지 확인 (연휴 21일 전 ~ 끝난 다음 날)
+        id: window
+        env:
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          # 출력: "in <명절> <시작>~<끝>" 또는 "out <다음 명절> <첫날>" (러너에 기본 설치된 node 로 계산 — npm 설치 전이라 빠르다)
+          read -r state key range < <(node scripts/holiday-window.mjs)
+          if [ "$state" = "in" ]; then
+            echo "수집 기간: $key ($range)"; echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$FORCE" = "true" ]; then
+            echo "명절 기간이 아니지만 수동 실행(force)이라 받습니다"; echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "오늘은 명절 수집 기간이 아닙니다. 다음 명절: ${key:-달력에 없음 — data/holidays.json 에 추가하세요} ${range}"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "### ➖ 명절 수집 기간 아님 (다음: ${key:-없음} ${range})" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/setup-node@v5
+        if: steps.window.outputs.run == 'true'
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+        if: steps.window.outputs.run == 'true'
+      - name: 공공데이터포털 연결 확인
+        id: connect
+        if: steps.window.outputs.run == 'true'
+        run: |
+          # GitHub 실행 서버(해외 IP) 일부는 공공데이터포털 접속이 막혀 있다. 막히면 이번 실행은 실패로 두고 다음 정기 실행(반나절 뒤)에 다시 받는다
+          for i in 1 2 3 4 5 6; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" -m 15 https://apis.data.go.kr/B552657/HolidyEmgncClnicInsttInfoInqireService/getHolidyClnicPosblEgytInfoInqire || true)
+            echo "apis.data.go.kr → HTTP $code ($i/6)"
+            if [ "$code" != "000" ]; then echo "ok=1" >> "$GITHUB_OUTPUT"; exit 0; fi
+            sleep 15
+          done
+          echo "- ❌ 이 실행 서버에서는 공공데이터포털에 연결되지 않아 받지 못했습니다. 다음 정기 실행에서 다시 받습니다." >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+      - name: 명절 비상진료기관 받기
+        if: steps.connect.outputs.ok == '1'
+        env:
+          DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: npx tsx scripts/ingest-holiday.ts
+      - name: 화면 캐시 갱신 (/holiday·병원 상세·약국 목록에 바로 반영)
+        if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && github.ref == 'refs/heads/main' }}
+        env:
+          REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
+          SITE_URL: ${{ vars.SITE_URL || 'https://hoscheck.com' }}
+        run: |
+          if [ -z "$REVALIDATE_SECRET" ]; then echo "REVALIDATE_SECRET 미설정 — 건너뜀"; exit 0; fi
+          for i in 1 2 3; do
+            if curl -fsS -X POST -H "Authorization: Bearer $REVALIDATE_SECRET" "$SITE_URL/api/revalidate"; then echo; exit 0; fi
+            sleep 20
+          done
+          echo "캐시 갱신 요청 실패"; exit 1
