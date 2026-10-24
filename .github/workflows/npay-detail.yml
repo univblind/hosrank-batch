@@ -11,9 +11,9 @@ on:
   workflow_dispatch:
     inputs:
       concurrency:
-        description: "동시에 받는 병원 수 (1~3). 기본 2 = 초당 약 3건, 약 9시간"
+        description: "동시에 받는 병원 수 (1~4). 4 = 초당 약 2~3건, 약 11시간"
         required: false
-        default: "2"
+        default: "4"
 
 concurrency:
   group: ingest
