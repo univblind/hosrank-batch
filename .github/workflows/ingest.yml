@@ -237,7 +237,7 @@ jobs:
           ARGS="--budget 9000 --concurrency 8"
           if [ "$HIRA_EXTRA" = "force" ]; then ARGS="$ARGS --force"; fi
           npx tsx scripts/ingest-hira-extra.ts $ARGS
-      - name: 병원별 비급여 (심평원 누리집, 매일 조금씩 · 한 달에 한 바퀴)
+      - name: 병원별 비급여 + 구분별 금액 (심평원 누리집, 매일 조금씩 · 한 달에 한 바퀴)
         id: npayweb
         if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && (env.IS_SCHEDULED == 'true' || contains(github.event.inputs.phase, 'npayweb')) }}
         env:
@@ -251,8 +251,9 @@ jobs:
             exit 0
           fi
           # 병원 하나에 한 번씩, 한 번에 하나씩 천천히 받는다(심평원 서버 부담 최소화, 초당 1~2건). 처음 한 바퀴(약 8만 곳)는 하루 1만 2천 곳씩 약 1주,
-          # 그 뒤로는 받은 지 30일 지난 병원만 하루 약 2,900곳(전체 ÷ 28). 150분이 지나면 받은 곳까지만 저장하고 다음 날 이어서 받는다
-          npx tsx scripts/ingest-npay-web.ts --minutes 150
+          # 그 뒤로는 받은 지 30일 지난 병원만 하루 약 2,900곳(전체 ÷ 28). 200분이 지나면 받은 곳까지만 저장하고 다음 날 이어서 받는다
+          # 범위로 보이는 항목이 있는 병원은 구분별 금액(예: 3000타·5000타)도 이어서 받는다(2026-10-25부터, 하루 약 40분 더 걸려 150→200분)
+          npx tsx scripts/ingest-npay-web.ts --minutes 200
       - name: 바뀐 병원 검색엔진 알림 (IndexNow, 매일)
         id: indexnow_changes
         # 병원을 바꾸는 모든 수집 단계가 끝난 뒤. 화면 정보 지문이 달라진 병원과 새 병원만 content_changed_at 을 올리고(사이트맵 lastmod),
