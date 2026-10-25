@@ -55,14 +55,14 @@ jobs:
         id: fresh
         if: github.event_name == 'schedule' && github.event.schedule == '47 20 * * *'
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # 병원 기본목록 수집이 전국 병원의 updated_at 을 고친다. 최근 8시간 안이면 오늘 수집은 이미 끝난 것
-          last=$(curl -s -m 20 "$SUPABASE_URL/rest/v1/hospitals?select=updated_at&order=updated_at.desc&limit=1" \
-            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" | jq -r '.[0].updated_at // empty')
-          echo "마지막 수집: ${last:-알 수 없음}"
-          if [ -n "$last" ] && [ $(( $(date -u +%s) - $(date -u -d "$last" +%s) )) -lt 28800 ]; then
+          # 오늘(한국 날짜) 이 수집이 성공으로 끝난 적이 있으면 건너뛴다.
+          # 예전엔 병원 기본목록의 updated_at 으로 판단했는데, 2026-10-25부터 바뀐 병원만 쓰므로(DB 디스크 절약) 그 값으로는 알 수 없다
+          since=$(date -u -d "$(TZ=Asia/Seoul date +%F) 00:00 +0900" +%Y-%m-%dT%H:%M:%SZ)
+          n=$(gh api "repos/${{ github.repository }}/actions/workflows/ingest.yml/runs?status=success&created=>=$since" -q '.total_count' 2>/dev/null || echo 0)
+          echo "오늘 성공한 수집: ${n}번 (한국 시간 0시 = $since 이후)"
+          if [ "${n:-0}" -gt 0 ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "오늘 수집이 이미 끝나 보조 실행을 건너뜁니다."
           fi
