@@ -135,17 +135,23 @@ jobs:
           PHASE=$(echo ",$INPUT_PHASE," | sed -e 's/,pharmacy,/,/g' -e 's/,nmchours,/,/g' -e 's/,checkup,/,/g' -e 's/,silson24,/,/g' -e 's/,holidays,/,/g' -e 's/,beds,/,/g' -e 's/,npayweb,/,/g' -e 's/^,*//' -e 's/,*$//')
           if [ -n "$INPUT_PHASE" ] && [ -z "$PHASE" ]; then echo "pharmacy·nmchours·checkup·silson24 만 실행"; exit 0; fi
           if [ -z "$PHASE" ]; then
-            # 기본: 기본목록·진료과목·평가등급·상세·점수.
-            # 진료과목별 소속(depts, 약 16분)은 거의 바뀌지 않아 월요일에만. 새 병원·바뀐 병원의 진료과목은 매일 상세(detail) 단계가 받는다
-            # 비급여는 API(병원급만) 대신 아래 '병원별 비급여' 단계가 심평원 누리집에서 병원·의원 모두 받는다(2026-10-23부터)
-            PHASE="basis,eval,detail,scores"
-            if [ "$(TZ=Asia/Seoul date +%u)" = "1" ]; then PHASE="basis,depts,eval,detail,scores"; fi
+            # 받는 날을 원천 갱신 주기에 맞춘다(2026-10-25, 공공데이터포털·법령 조사):
+            #  - 기본목록·진료과목·상세(진료시간·전문의·장비): 주 1회(월요일). 병원은 바뀐 내용을 15일 안에 신고하고, 심평원 공식 파일도 분기 1회다
+            #  - 평가등급: 월 1회(매월 1일). 항목별로 연중 발표하고 정해진 일정표가 없다
+            #  - 점수: 위 자료를 받은 날만 다시 계산한다
+            # 그 밖의 날은 이 단계에서 공공데이터를 부르지 않는다. 비급여는 아래 '병원별 비급여' 단계(매일 조금씩)
+            DOW=$(TZ=Asia/Seoul date +%u); DOM=$(TZ=Asia/Seoul date +%-d)
+            if [ "$DOW" = "1" ]; then PHASE="basis,depts,detail"; fi
+            if [ "$DOM" = "1" ]; then PHASE="${PHASE:+$PHASE,}eval"; fi
+            if [ -z "$PHASE" ]; then echo "오늘은 심평원 기본목록·상세·평가를 받는 날이 아님(월요일·매월 1일만)"; exit 0; fi
+            PHASE="$PHASE,scores"
           fi
-          ARGS="--phase $PHASE --budget 9000"
+          # 상세는 주 1회 9,000곳까지라 63일(9주)에 한 바퀴 다시 받는다. 새 병원은 그보다 먼저 받는다
+          ARGS="--phase $PHASE --budget 9000 --refresh-days 63"
           if [ -n "$INPUT_SIDO" ]; then ARGS="$ARGS --sido $INPUT_SIDO"; fi
           echo "npx tsx scripts/ingest.ts $ARGS"
           npx tsx scripts/ingest.ts $ARGS
-      - name: 응급실 (국립중앙의료원 응급의료기관 목록, 매일)
+      - name: 응급실 (국립중앙의료원 응급의료기관 목록, 매주 월요일)
         id: er
         if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && (env.IS_SCHEDULED == 'true' || contains(github.event.inputs.phase, 'er')) }}
         env:
@@ -154,6 +160,8 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           # 목록 약 530곳을 1번 호출로 받아 hospitals.er_night·er_class 를 맞춘다. 매칭이 400곳 미만이면 갱신하지 않고 실패한다
+          # 응급의료기관 지정은 자주 바뀌지 않아 주 1회(월요일). 실시간 가용병상은 화면을 열 때 바로 조회한다(src/lib/er-live.ts)
+          if [ "$IS_SCHEDULED" = "true" ] && [ "$(TZ=Asia/Seoul date +%u)" != "1" ]; then echo "월요일이 아니라 건너뜀"; exit 0; fi
           npx tsx scripts/ingest-er.ts
       - name: 병상 수 (심평원 시설정보, 30일마다 돌아가며)
         id: beds
@@ -165,7 +173,7 @@ jobs:
         run: |
           # 병원급 이상 약 4,200곳을 확인한 지 30일 지난 곳만 다시 받는다(평소 하루 100~200번 호출). 실패해도 화면에는 지난 값이 남는다
           npx tsx scripts/ingest-beds.ts || echo "::warning::병상 수 수집 실패"
-      - name: 공휴일 (한국천문연구원 특일 정보, 매일)
+      - name: 공휴일 (한국천문연구원 특일 정보, 매월 1일)
         id: holidays
         if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && (env.IS_SCHEDULED == 'true' || contains(github.event.inputs.phase, 'holidays')) }}
         env:
@@ -174,6 +182,8 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           # 올해·내년 공휴일(대체·임시공휴일 포함)을 2번 호출로 받는다. 실패해도 화면은 코드 안 목록으로 동작하므로 경고만 남긴다
+          # 다음 해 공휴일은 6월 말 발표, 임시공휴일은 수시라 월 1회(매월 1일)면 충분하다
+          if [ "$IS_SCHEDULED" = "true" ] && [ "$(TZ=Asia/Seoul date +%-d)" != "1" ]; then echo "매월 1일이 아니라 건너뜀"; exit 0; fi
           npx tsx scripts/ingest-holidays.ts
       - name: 약국 수집 (국립중앙의료원, 매주 월요일)
         id: pharmacy
@@ -198,7 +208,7 @@ jobs:
           # 심평원 상세(매일 일부씩)가 진료시간을 새로 받은 병원은 다음 주 이 단계에서 빠진다. 정기 실행은 월요일 03:00 KST 에만
           if [ "$IS_SCHEDULED" = "true" ] && [ "$(TZ=Asia/Seoul date +%u)" != "1" ]; then echo "월요일이 아니라 건너뜀"; exit 0; fi
           npx tsx scripts/ingest-nmc-hours.ts
-      - name: 국가건강검진기관 (국민건강보험공단, 매주 월요일)
+      - name: 국가건강검진기관 (국민건강보험공단, 매월 첫 월요일)
         id: checkup
         if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && (env.IS_SCHEDULED == 'true' || contains(github.event.inputs.phase, 'checkup')) }}
         env:
@@ -207,8 +217,8 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           # 전국 목록 4번 호출 + 검진유형내역 파일 1개 + 기관별 상세(접수·점심·예약) 최대 9,000곳(일 한도 10,000).
-          # 상세는 안 받은 곳 → 오래된 곳 순이라 전국 약 1만 8천 곳이 2주에 한 바퀴 돈다. 정기 실행은 월요일 03:00 KST 에만
-          if [ "$IS_SCHEDULED" = "true" ] && [ "$(TZ=Asia/Seoul date +%u)" != "1" ]; then echo "월요일이 아니라 건너뜀"; exit 0; fi
+          # 상세는 안 받은 곳 → 오래된 곳 순. 검진기관 정보는 자주 바뀌지 않아(공단 파일도 '수시') 월 1회(매월 첫 월요일)
+          if [ "$IS_SCHEDULED" = "true" ] && { [ "$(TZ=Asia/Seoul date +%u)" != "1" ] || [ "$(TZ=Asia/Seoul date +%-d)" -gt 7 ]; }; then echo "매월 첫 월요일이 아니라 건너뜀"; exit 0; fi
           npx tsx scripts/ingest-checkup.ts --detail-limit 9000
       - name: 실손24 참여 기관 (보험개발원, 매주 월요일 변경분)
         id: silson24
@@ -237,7 +247,7 @@ jobs:
           ARGS="--budget 9000 --concurrency 8"
           if [ "$HIRA_EXTRA" = "force" ]; then ARGS="$ARGS --force"; fi
           npx tsx scripts/ingest-hira-extra.ts $ARGS
-      - name: 병원별 비급여 + 구분별 금액 (심평원 누리집, 매일 조금씩 · 한 달에 한 바퀴)
+      - name: 병원별 비급여 + 구분별 금액 (심평원 누리집, 매일 조금씩 · 평소 두 달·정기 공개 뒤 한 달에 한 바퀴)
         id: npayweb
         if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && (env.IS_SCHEDULED == 'true' || contains(github.event.inputs.phase, 'npayweb')) }}
         env:
@@ -251,7 +261,8 @@ jobs:
             exit 0
           fi
           # 병원 하나에 한 번씩, 한 번에 하나씩 천천히 받는다(심평원 서버 부담 최소화, 초당 1~2건). 처음 한 바퀴(약 8만 곳)는 하루 1만 2천 곳씩 약 1주,
-          # 그 뒤로는 받은 지 30일 지난 병원만 하루 약 2,900곳(전체 ÷ 28). 200분이 지나면 받은 곳까지만 저장하고 다음 날 이어서 받는다
+          # 그 뒤로는 평소 56일(두 달)에 한 바퀴(하루 약 1,400곳), 비급여 정기 공개(매년 8월 마지막 수요일)부터 4주는 28일에 한 바퀴(하루 약 2,900곳).
+          # 바꿀 일수는 스크립트가 날짜로 정한다(보건복지부 고시 근거). 200분이 지나면 받은 곳까지만 저장하고 다음 날 이어서 받는다
           # 범위로 보이는 항목이 있는 병원은 구분별 금액(예: 3000타·5000타)도 이어서 받는다(2026-10-25부터, 하루 약 40분 더 걸려 150→200분)
           npx tsx scripts/ingest-npay-web.ts --minutes 200
       - name: 바뀐 병원 검색엔진 알림 (IndexNow, 매일)
