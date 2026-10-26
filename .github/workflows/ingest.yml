@@ -77,6 +77,8 @@ jobs:
         if: steps.fresh.outputs.skip != 'true'
         with:
           node-version: 22
+          # 실행 서버에 미리 깔린 옛 22.x 대신 최신 보안 패치를 받는다(2026-10-26: Node Brotli 취약점 CVE-2026-111497, 22.23.4 에서 고침)
+          check-latest: true
           cache: npm
       - run: npm ci
         if: steps.fresh.outputs.skip != 'true'
