@@ -333,10 +333,10 @@ jobs:
         id: warm
         # 캐시를 새로 고치면 처음 여는 사람이 무거운 페이지 생성을 기다린다(전국 비급여 2~4초, 사이트맵 10초 안팎).
         # 검색엔진이 먼저 들어와 느린 응답을 받지 않도록 바로 한 번씩 열어 둔다(scripts/warm-pages.ts, 실패해도 수집은 성공으로 둔다)
-        if: ${{ !cancelled() && steps.revalidate.outcome == success }}
+        if: ${{ !cancelled() && steps.revalidate.outcome == 'success' }}
         continue-on-error: true
         env:
-          SITE_URL: ${{ vars.SITE_URL || https://hoscheck.com }}
+          SITE_URL: ${{ vars.SITE_URL || 'https://hoscheck.com' }}
         run: npx tsx scripts/warm-pages.ts
       - name: 데이터 기준 월 반영 (data/meta.json 이 바뀐 날만 커밋 → Vercel 재배포)
         id: meta
