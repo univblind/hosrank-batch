@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       phase:
-        description: "실행 단계 (쉼표 구분: basis,depts,eval,nonpay,detail,scores,pharmacy,nmchours,checkup,silson24,holidays,beds,npayweb). 비우면 기본 조합"
+        description: "실행 단계 (쉼표 구분: basis,depts,eval,nonpay,detail,scores,pharmacy,nmchours,checkup,silson24,carins,holidays,beds,npayweb). 비우면 기본 조합"
         required: false
         default: ""
       retry_attempt:
@@ -132,7 +132,7 @@ jobs:
           INPUT_SIDO: ${{ github.event.inputs.sido }}
         run: |
           # pharmacy·nmchours·checkup·silson24 는 별도 스크립트(다음 단계들)라 여기서는 뺀다. 그것만 고르면 이 단계는 건너뛴다
-          PHASE=$(echo ",$INPUT_PHASE," | sed -e 's/,pharmacy,/,/g' -e 's/,nmchours,/,/g' -e 's/,checkup,/,/g' -e 's/,silson24,/,/g' -e 's/,holidays,/,/g' -e 's/,beds,/,/g' -e 's/,npayweb,/,/g' -e 's/^,*//' -e 's/,*$//')
+          PHASE=$(echo ",$INPUT_PHASE," | sed -e 's/,pharmacy,/,/g' -e 's/,nmchours,/,/g' -e 's/,checkup,/,/g' -e 's/,silson24,/,/g' -e 's/,carins,/,/g' -e 's/,holidays,/,/g' -e 's/,beds,/,/g' -e 's/,npayweb,/,/g' -e 's/^,*//' -e 's/,*$//')
           if [ -n "$INPUT_PHASE" ] && [ -z "$PHASE" ]; then echo "pharmacy·nmchours·checkup·silson24 만 실행"; exit 0; fi
           if [ -z "$PHASE" ]; then
             # 받는 날을 원천 갱신 주기에 맞춘다(2026-10-25, 공공데이터포털·법령 조사):
@@ -232,6 +232,18 @@ jobs:
           # 정기 실행은 월요일 03:00 KST(일요일 UTC)에만. 수동 실행에서 phase 에 silson24 를 넣으면 바로 돈다
           if [ "$IS_SCHEDULED" = "true" ] && [ "$(TZ=Asia/Seoul date +%u)" != "1" ]; then echo "월요일이 아니라 건너뜀"; exit 0; fi
           npx tsx scripts/ingest-silson24.ts
+      - name: 자동차보험 진료기관 (심평원, 매주 월요일)
+        id: carins
+        if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && (env.IS_SCHEDULED == 'true' || contains(github.event.inputs.phase, 'carins')) }}
+        env:
+          DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          # 최근 1년 안에 자동차보험 진료비를 청구한 기관 목록 전체(약 2만 7천 곳, 1,000곳씩 28회)를 받아 병원 상세 '자동차보험 진료' 표시를 맞춘다.
+          # 정기 실행은 월요일 03:00 KST 에만. 수동 실행에서 phase 에 carins 를 넣으면 바로 돈다
+          if [ "$IS_SCHEDULED" = "true" ] && [ "$(TZ=Asia/Seoul date +%u)" != "1" ]; then echo "월요일이 아니라 건너뜀"; exit 0; fi
+          npx tsx scripts/ingest-car-insurance.ts
       - name: 의원 많이 진료한 질병·평가 우수기관 (심평원, 매일 한도만큼 · 우수기관 매월)
         id: hiraextra
         if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && (env.IS_SCHEDULED == 'true' || github.event.inputs.hira_extra != '') }}
