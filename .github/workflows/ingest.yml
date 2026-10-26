@@ -329,6 +329,15 @@ jobs:
             sleep 20
           done
           echo "캐시 갱신 요청 실패"; exit 1
+      - name: 화면 미리 열기 (캐시 갱신 뒤 허브·전국 비급여·사이트맵)
+        id: warm
+        # 캐시를 새로 고치면 처음 여는 사람이 무거운 페이지 생성을 기다린다(전국 비급여 2~4초, 사이트맵 10초 안팎).
+        # 검색엔진이 먼저 들어와 느린 응답을 받지 않도록 바로 한 번씩 열어 둔다(scripts/warm-pages.ts, 실패해도 수집은 성공으로 둔다)
+        if: ${{ !cancelled() && steps.revalidate.outcome == success }}
+        continue-on-error: true
+        env:
+          SITE_URL: ${{ vars.SITE_URL || https://hoscheck.com }}
+        run: npx tsx scripts/warm-pages.ts
       - name: 데이터 기준 월 반영 (data/meta.json 이 바뀐 날만 커밋 → Vercel 재배포)
         id: meta
         # 앞 단계 일부가 실패해도, 성공한 수집이 올린 기준 월은 반영한다(실패한 수집은 기준 월을 올리지 않는다)
