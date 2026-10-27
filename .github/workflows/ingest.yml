@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       phase:
-        description: "실행 단계 (쉼표 구분: basis,depts,eval,nonpay,detail,scores,pharmacy,nmchours,checkup,silson24,carins,holidays,beds,npayweb). 비우면 기본 조합"
+        description: "실행 단계 (쉼표 구분: basis,depts,eval,nonpay,detail,scores,pharmacy,nmchours,checkup,silson24,carins,holidays,beds,npayweb,npayindex). 비우면 기본 조합"
         required: false
         default: ""
       retry_attempt:
@@ -134,7 +134,7 @@ jobs:
           INPUT_SIDO: ${{ github.event.inputs.sido }}
         run: |
           # pharmacy·nmchours·checkup·silson24 는 별도 스크립트(다음 단계들)라 여기서는 뺀다. 그것만 고르면 이 단계는 건너뛴다
-          PHASE=$(echo ",$INPUT_PHASE," | sed -e 's/,pharmacy,/,/g' -e 's/,nmchours,/,/g' -e 's/,checkup,/,/g' -e 's/,silson24,/,/g' -e 's/,carins,/,/g' -e 's/,holidays,/,/g' -e 's/,beds,/,/g' -e 's/,npayweb,/,/g' -e 's/^,*//' -e 's/,*$//')
+          PHASE=$(echo ",$INPUT_PHASE," | sed -e 's/,pharmacy,/,/g' -e 's/,nmchours,/,/g' -e 's/,checkup,/,/g' -e 's/,silson24,/,/g' -e 's/,carins,/,/g' -e 's/,holidays,/,/g' -e 's/,beds,/,/g' -e 's/,npayweb,/,/g' -e 's/,npayindex,/,/g' -e 's/^,*//' -e 's/,*$//')
           if [ -n "$INPUT_PHASE" ] && [ -z "$PHASE" ]; then echo "pharmacy·nmchours·checkup·silson24 만 실행"; exit 0; fi
           if [ -z "$PHASE" ]; then
             # 받는 날을 원천 갱신 주기에 맞춘다(2026-10-25, 공공데이터포털·법령 조사):
@@ -279,6 +279,24 @@ jobs:
           # 바꿀 일수는 스크립트가 날짜로 정한다(보건복지부 고시 근거). 200분이 지나면 받은 곳까지만 저장하고 다음 날 이어서 받는다
           # 범위로 보이는 항목이 있는 병원은 구분별 금액(예: 3000타·5000타)도 이어서 받는다(2026-10-25부터, 하루 약 40분 더 걸려 150→200분)
           npx tsx scripts/ingest-npay-web.ts --minutes 200
+      - name: 비급여 항목 목록 갱신 (매월 1일 · 심평원 업데이트를 다 따라잡은 날)
+        id: npayindex
+        # 검색('이름으로 찾기')·항목별 가격 페이지가 쓰는 항목 목록(src/data/npay-index.json)과 드문 항목의 병원별 가격(npay-rare-hospitals.json)을
+        # 우리 DB 로 다시 만든다(심평원에 요청하지 않는다). 새 항목이 생기거나 공개 병원 수가 바뀐 것을 사람 손 없이 반영(2026-10-27 요청).
+        # 바뀐 파일은 아래 '데이터 갱신 반영' 단계가 커밋한다(→ Vercel 재배포)
+        if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && (env.IS_SCHEDULED == 'true' || contains(github.event.inputs.phase, 'npayindex')) }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          FORCE: ${{ contains(github.event.inputs.phase, 'npayindex') }}
+        run: |
+          DAY=$(TZ=Asia/Seoul date +%d)
+          # 따라잡기가 오늘 끝나면 비급여 수집이 data/npay-refresh.json 을 지운다(git 이 '지워짐'으로 본다)
+          CAUGHT_UP=$(git status --porcelain -- data/npay-refresh.json | grep -c '^ D' || true)
+          if [ "$DAY" != "01" ] && [ "$CAUGHT_UP" = "0" ] && [ "$FORCE" != "true" ]; then echo "오늘은 갱신하는 날이 아님"; exit 0; fi
+          npx tsx scripts/build-npay-index.ts > /tmp/npay-index.log
+          head -3 /tmp/npay-index.log
+          echo "- 비급여 항목 목록: $(grep -m1 '항목' /tmp/npay-index.log)" >> "$INGEST_SUMMARY_FILE"
       - name: 바뀐 병원 검색엔진 알림 (IndexNow, 매일)
         id: indexnow_changes
         # 병원을 바꾸는 모든 수집 단계가 끝난 뒤. 화면 정보 지문이 달라진 병원과 새 병원만 content_changed_at 을 올리고(사이트맵 lastmod),
@@ -338,25 +356,35 @@ jobs:
         env:
           SITE_URL: ${{ vars.SITE_URL || 'https://hoscheck.com' }}
         run: npx tsx scripts/warm-pages.ts
-      - name: 데이터 기준 월 반영 (data/meta.json 이 바뀐 날만 커밋 → Vercel 재배포)
+      - name: 데이터 갱신 반영 (기준 월·비급여 따라잡기 상태·비급여 항목 목록이 바뀐 날만 커밋 → Vercel 재배포)
         id: meta
         # 앞 단계 일부가 실패해도, 성공한 수집이 올린 기준 월은 반영한다(실패한 수집은 기준 월을 올리지 않는다)
         # main 에서 돌 때만 (다른 브랜치에서 수동 실행하면 그 브랜치 커밋이 main 으로 올라가지 않게)
+        # data/npay-refresh.json: 심평원 업데이트를 감지하면 생기고(다음 실행부터 전체 다시 받기), 다 따라잡으면 지워진다(scripts/ingest-npay-web.ts)
         if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && github.ref == 'refs/heads/main' }}
         run: |
-          if git diff --quiet -- data/meta.json; then echo "기준 월 변화 없음 — 커밋하지 않음"; echo "- 데이터 기준 월: 그대로" >> "$INGEST_SUMMARY_FILE"; exit 0; fi
-          git diff -- data/meta.json
-          SUMMARY=$(node -e 'const m=require("./data/meta.json");console.log(Object.entries(m).map(([k,v])=>k+" "+v.month).join(", "))')
+          FILES="data/meta.json data/npay-refresh.json src/data/npay-index.json src/data/npay-rare-hospitals.json"
+          if [ -z "$(git status --porcelain -- $FILES)" ]; then echo "바뀐 데이터 파일 없음 — 커밋하지 않음"; echo "- 데이터 파일: 그대로" >> "$INGEST_SUMMARY_FILE"; exit 0; fi
+          git status --porcelain -- $FILES
+          PARTS=""
+          if [ -n "$(git status --porcelain -- data/meta.json)" ]; then
+            PARTS="기준 월 $(node -e 'const m=require("./data/meta.json");console.log(Object.entries(m).map(([k,v])=>k+" "+v.month).join(", "))')"
+          fi
+          if [ -n "$(git status --porcelain -- data/npay-refresh.json)" ]; then
+            if [ -f data/npay-refresh.json ]; then PARTS="$PARTS · 심평원 비급여 업데이트 감지(전체 다시 받기 시작)"; else PARTS="$PARTS · 심평원 비급여 업데이트 따라잡기 끝"; fi
+          fi
+          if [ -n "$(git status --porcelain -- src/data/npay-index.json src/data/npay-rare-hospitals.json)" ]; then PARTS="$PARTS · 비급여 항목 목록"; fi
+          SUMMARY=$(echo "$PARTS" | sed 's/^ · //')
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/meta.json
-          git commit -m "데이터 기준 월 갱신: $SUMMARY"
+          git add -A -- $FILES
+          git commit -m "데이터 갱신: $SUMMARY"
           # 그사이 다른 커밋이 올라왔을 수 있어 최신 main 위로 올린 뒤 푸시한다
           for i in 1 2 3; do
-            if git pull --rebase origin main && git push origin HEAD:main; then echo "- 데이터 기준 월 갱신: $SUMMARY (사이트 재배포)" >> "$INGEST_SUMMARY_FILE"; exit 0; fi
+            if git pull --rebase origin main && git push origin HEAD:main; then echo "- 데이터 갱신: $SUMMARY (사이트 재배포)" >> "$INGEST_SUMMARY_FILE"; exit 0; fi
             sleep 10
           done
-          echo "기준 월 커밋 푸시 실패"; exit 1
+          echo "데이터 갱신 커밋 푸시 실패"; exit 1
       - name: 새 서버로 다시 실행 (공공데이터포털 연결 안 됨)
         id: retry
         if: ${{ !cancelled() && steps.fresh.outputs.skip != 'true' && steps.connect.outputs.ok != '1' && env.IS_SCHEDULED == 'true' }}
