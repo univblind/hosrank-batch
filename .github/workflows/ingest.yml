@@ -44,6 +44,8 @@ jobs:
       contents: write
       # 공공데이터포털에 연결되지 않는 서버에 배정되면 이 워크플로를 새 서버로 다시 실행한다
       actions: write
+      # 실패하면 이 저장소에 알림 이슈를 연다(→ 저장소 주인 메일)
+      issues: write
     env:
       # 각 수집 스크립트가 한국어 결과를 여기에 모으고, 마지막 '결과 요약' 단계가 실행 화면 맨 위에 보여 준다
       INGEST_SUMMARY_FILE: /tmp/ingest-summary.md
@@ -363,7 +365,7 @@ jobs:
         # data/npay-refresh.json: 심평원 업데이트를 감지하면 생기고(다음 실행부터 전체 다시 받기), 다 따라잡으면 지워진다(scripts/ingest-npay-web.ts)
         if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && github.ref == 'refs/heads/main' }}
         run: |
-          FILES="data/meta.json data/npay-refresh.json src/data/npay-index.json src/data/npay-rare-hospitals.json"
+          FILES="data/meta.json data/npay-refresh.json data/npay-period.json src/data/npay-index.json src/data/npay-rare-hospitals.json"
           if [ -z "$(git status --porcelain -- $FILES)" ]; then echo "바뀐 데이터 파일 없음 — 커밋하지 않음"; echo "- 데이터 파일: 그대로" >> "$INGEST_SUMMARY_FILE"; exit 0; fi
           git status --porcelain -- $FILES
           PARTS=""
@@ -373,6 +375,7 @@ jobs:
           if [ -n "$(git status --porcelain -- data/npay-refresh.json)" ]; then
             if [ -f data/npay-refresh.json ]; then PARTS="$PARTS · 심평원 비급여 업데이트 감지(전체 다시 받기 시작)"; else PARTS="$PARTS · 심평원 비급여 업데이트 따라잡기 끝"; fi
           fi
+          if [ -n "$(git status --porcelain -- data/npay-period.json)" ]; then PARTS="$PARTS · 비급여 공개일 $(node -e 'console.log(require("./data/npay-period.json").published)')"; fi
           if [ -n "$(git status --porcelain -- src/data/npay-index.json src/data/npay-rare-hospitals.json)" ]; then PARTS="$PARTS · 비급여 항목 목록"; fi
           SUMMARY=$(echo "$PARTS" | sed 's/^ · //')
           git config user.name "github-actions[bot]"
@@ -469,3 +472,18 @@ jobs:
             if [ -n "$fails" ]; then echo "실패한 단계는 왼쪽 목록에서 그 단계를 눌러 자세한 기록을 볼 수 있습니다."; echo; fi
             if [ -f "$INGEST_SUMMARY_FILE" ]; then echo "---"; echo; cat "$INGEST_SUMMARY_FILE"; fi
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: 실패 알림 (이 저장소에 이슈 → 저장소 주인 메일)
+        # 어느 단계든 실패하면(공공데이터포털 연결 실패는 새 서버로 다시 실행하므로 빼고) 이슈를 연다. 이미 열린 알림이 있으면 댓글만 단다.
+        # 사람이 매일 실행 화면을 보지 않아도 고장을 바로 알게(2026-10-27 요청 — 사람 손 없이 운영, 고장 나면 알림)
+        if: ${{ failure() && steps.connect.outputs.ok == '1' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="[알림] 공공데이터 수집 배치 실패"
+          BODY="$(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M') KST 실행이 실패했습니다. 실행 화면 맨 위 '결과 요약'에서 실패한 단계를 확인하세요.
+          $RUN_URL
+
+          @${{ github.repository_owner }}"
+          NUM=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "in:title \"$TITLE\"" --json number -q '.[0].number')
+          if [ -n "$NUM" ]; then gh issue comment "$NUM" -R "$GITHUB_REPOSITORY" --body "$BODY"; else gh issue create -R "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY"; fi
