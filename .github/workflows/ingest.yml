@@ -314,6 +314,19 @@ jobs:
           npx tsx scripts/build-station-dongs.ts > /tmp/station-dongs.log
           head -3 /tmp/station-dongs.log
           echo "- 역 이름 → 동: $(grep -m1 '역 ' /tmp/station-dongs.log)" >> "$INGEST_SUMMARY_FILE"
+      - name: 통계 리포트 숫자 갱신 (기준 월이 바뀐 날만)
+        id: stats_snapshot
+        # /stats·CSV 의 전국 집계(약 45초)를 화면을 열 때마다 하지 않고 파일(src/data/stats-snapshot.json)로 둔다(2026-10-30).
+        # 스크립트가 data/meta.json 의 기준 월과 파일의 기준 월을 비교해, 같으면 아무것도 하지 않는다. 바뀌면 아래 단계가 커밋한다(월 1회 재배포)
+        if: ${{ !cancelled() && steps.connect.outputs.ok == '1' }}
+        continue-on-error: true
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          npx tsx scripts/build-stats-snapshot.ts > /tmp/stats-snapshot.log 2>&1 || { cat /tmp/stats-snapshot.log; echo "::warning::통계 파일 갱신 실패(이전 달 숫자 유지)"; exit 0; }
+          cat /tmp/stats-snapshot.log
+          echo "- 통계 리포트: $(tail -1 /tmp/stats-snapshot.log)" >> "$INGEST_SUMMARY_FILE"
       - name: 바뀐 병원 검색엔진 알림 (IndexNow, 매일)
         id: indexnow_changes
         # 병원을 바꾸는 모든 수집 단계가 끝난 뒤. 화면 정보 지문이 달라진 병원과 새 병원만 content_changed_at 을 올리고(사이트맵 lastmod),
@@ -385,7 +398,7 @@ jobs:
         # data/npay-refresh.json: 심평원 업데이트를 감지하면 생기고(다음 실행부터 전체 다시 받기), 다 따라잡으면 지워진다(scripts/ingest-npay-web.ts)
         if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && github.ref == 'refs/heads/main' }}
         run: |
-          FILES="data/meta.json data/npay-refresh.json data/npay-period.json src/data/npay-index.json src/data/npay-rare-hospitals.json src/data/station-dongs.json"
+          FILES="data/meta.json data/npay-refresh.json data/npay-period.json src/data/npay-index.json src/data/npay-rare-hospitals.json src/data/station-dongs.json src/data/stats-snapshot.json"
           if [ -z "$(git status --porcelain -- $FILES)" ]; then echo "바뀐 데이터 파일 없음 — 커밋하지 않음"; echo "- 데이터 파일: 그대로" >> "$INGEST_SUMMARY_FILE"; exit 0; fi
           git status --porcelain -- $FILES
           PARTS=""
@@ -398,6 +411,7 @@ jobs:
           if [ -n "$(git status --porcelain -- data/npay-period.json)" ]; then PARTS="$PARTS · 비급여 공개일 $(node -e 'console.log(require("./data/npay-period.json").published)')"; fi
           if [ -n "$(git status --porcelain -- src/data/npay-index.json src/data/npay-rare-hospitals.json)" ]; then PARTS="$PARTS · 비급여 항목 목록"; fi
           if [ -n "$(git status --porcelain -- src/data/station-dongs.json)" ]; then PARTS="$PARTS · 역 이름 → 동 목록"; fi
+          if [ -n "$(git status --porcelain -- src/data/stats-snapshot.json)" ]; then PARTS="$PARTS · 통계 리포트 숫자"; fi
           SUMMARY=$(echo "$PARTS" | sed 's/^ · //')
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
