@@ -264,7 +264,7 @@ jobs:
           ARGS="--budget 9000 --concurrency 8"
           if [ "$HIRA_EXTRA" = "force" ]; then ARGS="$ARGS --force"; fi
           npx tsx scripts/ingest-hira-extra.ts $ARGS
-      - name: 병원별 비급여 + 구분별 금액 (심평원 누리집, 매일 조금씩 · 평소 두 달·정기 공개 뒤 한 달에 한 바퀴)
+      - name: 병원별 비급여 + 구분별 금액 (심평원 누리집, 매일 조금씩 · 2주에 한 바퀴)
         id: npayweb
         if: ${{ !cancelled() && steps.connect.outputs.ok == '1' && (env.IS_SCHEDULED == 'true' || contains(github.event.inputs.phase, 'npayweb')) }}
         env:
@@ -278,8 +278,8 @@ jobs:
             exit 0
           fi
           # 병원 하나에 한 번씩, 한 번에 하나씩 천천히 받는다(심평원 서버 부담 최소화, 초당 1~2건). 처음 한 바퀴(약 8만 곳)는 하루 1만 2천 곳씩 약 1주,
-          # 그 뒤로는 평소 56일(두 달)에 한 바퀴(하루 약 1,400곳), 비급여 정기 공개(매년 8월 마지막 수요일)부터 4주는 28일에 한 바퀴(하루 약 2,900곳).
-          # 바꿀 일수는 스크립트가 날짜로 정한다(보건복지부 고시 근거). 200분이 지나면 받은 곳까지만 저장하고 다음 날 이어서 받는다
+          # 그 뒤로는 14일(2주)에 한 바퀴(하루 약 5,700곳, 약 1시간 반 — 2026-11-05 두 달에서 줄임).
+          # 급하면 scripts/ingest-npay-web.ts --ids 로 그 병원만 바로 받는다. 200분이 지나면 받은 곳까지만 저장하고 다음 날 이어서 받는다
           # 범위로 보이는 항목이 있는 병원은 구분별 금액(예: 3000타·5000타)도 이어서 받는다(2026-10-25부터, 하루 약 40분 더 걸려 150→200분)
           npx tsx scripts/ingest-npay-web.ts --minutes 200
       - name: 비급여 항목 목록 갱신 (매월 1일 · 심평원 업데이트를 다 따라잡은 날)
