@@ -27,6 +27,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # 기본 셸은 명령 하나가 실패하면 바로 멈춘다(bash -e). 연결 오류(curl 35 등)도 '실패한 페이지'로 세야 하므로 끈다
+          set +e
           SITE=https://hoscheck.com
           UA="hoscheck-probe/1.0"
           T=$(date +%s)
@@ -38,7 +40,7 @@ jobs:
           N=$(echo "$URLS" | wc -l)
           echo "점검할 페이지 $N개"
           check() { # 응답 코드(이동은 따라감). 25초 넘으면 000
-            curl -sL -o /dev/null --max-time 25 -A "$UA" -w '%{http_code} %{time_total}' "$1$(case "$1" in *\?*) echo '&';; *) echo '?';; esac)_probe=$T$2"
+            curl -sL -o /dev/null --max-time 25 -A "$UA" -w '%{http_code} %{time_total}' "$1$(case "$1" in *\?*) echo '&';; *) echo '?';; esac)_probe=$T$2" || true
           }
           FAILED=""
           while read -r u; do
