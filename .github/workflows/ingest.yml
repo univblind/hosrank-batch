@@ -53,9 +53,12 @@ jobs:
       IS_SCHEDULED: ${{ github.event_name == 'schedule' || github.event.inputs.retry_attempt != '' }}
       ATTEMPT: ${{ github.event.inputs.retry_attempt || '1' }}
     steps:
-      - name: 오늘 수집 여부 확인 (보조 실행만)
+      - name: 오늘 수집 여부 확인 (GitHub 정기 실행만)
         id: fresh
-        if: github.event_name == 'schedule' && github.event.schedule == '47 20 * * *'
+        # 2026-11-20: 병원체크 Vercel 예약 작업이 한국 시간 3시대에 이 수집을 '정기 실행 한 번'(retry_attempt=1)으로 바로 부른다.
+        # GitHub 정기 실행이 6~7시간 늦게 시작해(11/19 은 09:24) 오전 내내 머리글이 전날 '갱신'이었기 때문이다.
+        # 그래서 늦게 도착한 정기 실행(03:17·05:47 둘 다)은 그날 이미 성공한 수집이 있으면 건너뛴다
+        if: github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -86,7 +89,7 @@ jobs:
         if: steps.fresh.outputs.skip != 'true'
       - name: 도메인 만료 확인 (hoscheck.com, 30일 전부터 경고)
         id: domain
-        if: github.event_name == 'schedule' && steps.fresh.outputs.skip != 'true'
+        if: env.IS_SCHEDULED == 'true' && steps.fresh.outputs.skip != 'true'
         continue-on-error: true
         run: |
           # 가비아에서 산 도메인이라 자동 연장은 가비아 설정을 따른다. 만료가 다가오면 실패로 표시해 메일이 가게 한다
